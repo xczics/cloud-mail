@@ -375,6 +375,102 @@ const emailService = {
 		return [ emailResult ];
 	},
 
+	async sendInternal(c, params) {
+
+		const {
+			sender,
+			receiveEmail,
+			subject,
+			text,
+			content,
+			name
+		} = params;
+
+		// 验证 API Key
+		const apiKey = c.req.header('X-API-Key');
+		if (!apiKey || apiKey !== c.env.internal_api_key) {
+			throw new BizError('Invalid or missing API key', 401);
+		}
+
+		// 获取系统设置（含 domainList）
+		const { send, domainList } = await settingService.query(c);
+
+		if (send === settingConst.send.CLOSE) {
+			throw new BizError('Send function is disabled', 403);
+		}
+
+		// 验证发件人邮箱
+		if (!sender) {
+			throw new BizError('Sender email is required', 400);
+		}
+
+		// 查找发件人账号
+		const accountRow = await accountService.selectByEmailIncludeDel(c, sender);
+		if (!accountRow) {
+			throw new BizError('Sender account not found: ' + sender, 404);
+		}
+
+		// 获取发件人用户信息
+		const userRow = await userService.selectByIdIncludeDel(c, accountRow.userId);
+		if (!userRow) {
+			throw new BizError('Sender user not found', 404);
+		}
+
+		// 验证发件人邮箱域名在 domainList 中
+		const senderDomain = '@' + emailUtils.getDomain(sender);
+		if (!domainList.includes(senderDomain)) {
+			throw new BizError('Sender domain is not managed: ' + senderDomain, 400);
+		}
+
+		// 验证收件人
+		if (!receiveEmail || !Array.isArray(receiveEmail) || receiveEmail.length === 0) {
+			throw new BizError('receiveEmail must be a non-empty array', 400);
+		}
+
+		if (receiveEmail.length > 50) {
+			throw new BizError('Too many recipients (max 50)', 400);
+		}
+
+		// 验证所有收件人均为站内邮箱
+		const allInternal = receiveEmail.every(email => {
+			const domain = '@' + emailUtils.getDomain(email);
+			return domainList.includes(domain);
+		});
+
+		if (!allInternal) {
+			throw new BizError('send-internal only accepts internal recipients (managed domains)', 400);
+		}
+
+		// 构建发件人显示名
+		const senderName = name || emailUtils.getName(sender);
+
+		// 构建 SEND 类型邮件记录
+		const emailData = {
+			sendEmail: sender,
+			name: senderName,
+			subject: subject || '',
+			content: content || '',
+			text: text || '',
+			accountId: accountRow.accountId,
+			userId: accountRow.userId,
+			status: emailConst.status.DELIVERED,
+			type: emailConst.type.SEND,
+			recipient: JSON.stringify(receiveEmail.map(email => ({ address: email, name: '' })))
+		};
+
+		// 保存到数据库
+		const emailResult = await orm(c).insert(email).values(emailData).returning().get();
+
+		// 站内投递：为每位收件人生成 RECEIVE 记录
+		await this.HandleOnSiteEmail(c, receiveEmail, emailResult, []);
+
+		return {
+			emailId: emailResult.emailId,
+			status: 'delivered',
+			recipients: receiveEmail
+		};
+	},
+
 	async sendByCloudflareEmail(c, params) {
 		const sendForm = {
 			from: { email: params.accountEmail, name: params.name },
