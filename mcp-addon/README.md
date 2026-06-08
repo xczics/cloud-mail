@@ -6,12 +6,10 @@ MCP (Model Context Protocol) server for Cloud Mail — enables LingTai agents to
 
 - Node.js 18+
 - A deployed Cloud Mail instance with the following API endpoints:
-  - `POST /api/email/send-internal`
-  - `GET /api/email/inbox`
-  - `GET /api/email/read/:emailId`
-  - `POST /api/email/reply`
-  - `GET /api/email/search`
-- An `INTERNAL_API_KEY` configured on the Cloud Mail Worker
+  - `POST /api/email/send-internal` — send internal email (API Key auth)
+  - `POST /api/public/genToken` — admin login for public API token
+  - `POST /api/public/emailList` — query emails (with token auth)
+- An admin email/password account on the Cloud Mail system
 
 ## Configuration
 
@@ -20,6 +18,8 @@ Set the following environment variables:
 | Variable | Description |
 |---|---|
 | `CLOUD_MAIL_URL` | Base URL of the Cloud Mail Worker (e.g. `https://mail.example.com`) |
+| `CLOUD_MAIL_ADMIN_EMAIL` | Admin email for public API authentication |
+| `CLOUD_MAIL_ADMIN_PASS` | Admin password for public API authentication |
 | `CLOUD_MAIL_API_KEY` | The `internal_api_key` value configured on the Worker |
 | `AGENT_EMAIL` | The agent's managed email address (e.g. `myagent@example.com`) |
 
@@ -80,6 +80,8 @@ To register this MCP addon in a LingTai agent, add the following to the agent's 
       "args": ["/path/to/cloud-mail/mcp-addon/index.js"],
       "env": {
         "CLOUD_MAIL_URL": "https://your-worker.example.com",
+        "CLOUD_MAIL_ADMIN_EMAIL": "admin@yourdomain.com",
+        "CLOUD_MAIL_ADMIN_PASS": "your-admin-password",
         "CLOUD_MAIL_API_KEY": "your-api-key",
         "AGENT_EMAIL": "agent@yourdomain.com"
       }
