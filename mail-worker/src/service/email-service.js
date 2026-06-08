@@ -1082,6 +1082,167 @@ const emailService = {
 	async read(c, params, userId) {
 		const { emailIds } = params;
 		await orm(c).update(email).set({ unread: emailConst.unread.READ }).where(and(eq(email.userId, userId), inArray(email.emailId, emailIds)));
+	},
+
+	// ===== API Key 认证的收件 API =====
+
+	async inbox(c, params) {
+		const { email: emailAddress, unread, limit: limitParam } = params;
+		const limit = Math.min(Number(limitParam) || 20, 100);
+
+		if (!emailAddress) {
+			throw new BizError('email parameter is required', 400);
+		}
+
+		const conditions = [
+			eq(email.toEmail, emailAddress),
+			eq(email.type, emailConst.type.RECEIVE),
+			eq(email.isDel, isDel.NORMAL)
+		];
+
+		if (unread === 'true' || unread === true) {
+			conditions.push(eq(email.unread, emailConst.unread.UNREAD));
+		}
+
+		const list = await orm(c).select({
+			emailId: email.emailId,
+			sendEmail: email.sendEmail,
+			name: email.name,
+			subject: email.subject,
+			text: email.text,
+			toEmail: email.toEmail,
+			type: email.type,
+			status: email.status,
+			unread: email.unread,
+			createTime: email.createTime
+		}).from(email).where(and(...conditions))
+			.orderBy(desc(email.emailId))
+			.limit(limit)
+			.all();
+
+		await this.emailAddAtt(c, list);
+		return list;
+	},
+
+	async readDetail(c, emailId) {
+		const emailRow = await this.selectById(c, emailId);
+		if (!emailRow) {
+			throw new BizError('Email not found', 404);
+		}
+
+		// 标记为已读
+		await orm(c).update(email).set({ unread: emailConst.unread.READ })
+			.where(eq(email.emailId, emailId)).run();
+
+		// 附加附件
+		const attList = await attService.selectByEmailIds(c, [emailId]);
+		emailRow.attList = attList;
+
+		return emailRow;
+	},
+
+	async replyEmail(c, params) {
+		const { emailId, content, text, name } = params;
+
+		if (!emailId) {
+			throw new BizError('emailId is required', 400);
+		}
+
+		// 查找原始邮件
+		const originalEmail = await this.selectById(c, emailId);
+		if (!originalEmail) {
+			throw new BizError('Original email not found', 404);
+		}
+
+		// 查找对应的 account
+		const accountRow = await accountService.selectByEmailIncludeDel(c, originalEmail.toEmail);
+		if (!accountRow) {
+			throw new BizError('Recipient account not found for reply', 404);
+		}
+
+		const senderName = name || accountRow.name || emailUtils.getName(accountRow.email);
+
+		// 构建回复邮件记录（SEND 类型）
+		const emailData = {
+			sendEmail: originalEmail.toEmail,
+			name: senderName,
+			subject: originalEmail.subject ? 'Re: ' + originalEmail.subject : 'Re:',
+			content: content || '',
+			text: text || '',
+			accountId: accountRow.accountId,
+			userId: accountRow.userId,
+			status: emailConst.status.DELIVERED,
+			type: emailConst.type.SEND,
+			inReplyTo: originalEmail.messageId,
+			relation: originalEmail.relation || originalEmail.messageId,
+			recipient: JSON.stringify([{ address: originalEmail.sendEmail, name: '' }])
+		};
+
+		const result = await orm(c).insert(email).values(emailData).returning().get();
+
+		// 如果收件人是站内用户，触发站内投递
+		const { domainList } = await settingService.query(c);
+		const recipientDomain = '@' + emailUtils.getDomain(originalEmail.sendEmail);
+		if (domainList.includes(recipientDomain)) {
+			await this.HandleOnSiteEmail(c, [originalEmail.sendEmail], result, []);
+		}
+
+		return {
+			emailId: result.emailId,
+			status: 'sent',
+			to: originalEmail.sendEmail
+		};
+	},
+
+	async searchEmails(c, params) {
+		const { email: emailAddress, query, limit: limitParam } = params;
+		const limit = Math.min(Number(limitParam) || 20, 100);
+
+		if (!emailAddress) {
+			throw new BizError('email parameter is required', 400);
+		}
+
+		const conditions = [
+			eq(email.isDel, isDel.NORMAL),
+			or(
+				eq(email.toEmail, emailAddress),
+				and(
+					eq(email.sendEmail, emailAddress),
+					eq(email.type, emailConst.type.SEND)
+				)
+			)
+		];
+
+		if (query) {
+			conditions.push(
+				or(
+					like(email.subject, `%${query}%`),
+					like(email.text, `%${query}%`),
+					like(email.content, `%${query}%`),
+					like(email.sendEmail, `%${query}%`),
+					like(email.name, `%${query}%`)
+				)
+			);
+		}
+
+		const list = await orm(c).select({
+			emailId: email.emailId,
+			sendEmail: email.sendEmail,
+			name: email.name,
+			subject: email.subject,
+			text: email.text,
+			toEmail: email.toEmail,
+			type: email.type,
+			status: email.status,
+			unread: email.unread,
+			createTime: email.createTime
+		}).from(email).where(and(...conditions))
+			.orderBy(desc(email.emailId))
+			.limit(limit)
+			.all();
+
+		await this.emailAddAtt(c, list);
+		return list;
 	}
 };
 

@@ -19,7 +19,11 @@ const exclude = [
 	'/telegram',
 	'/test',
 	'/oauth',
-	'/email/send-internal'
+	'/email/send-internal',
+		'/email/inbox',
+		'/email/inbox/',
+		'/email/read/',
+		'/email/reply'
 ];
 
 const requirePerms = [
