@@ -2,13 +2,16 @@
 /**
  * Cloud Mail MCP Addon
  * 
- * Implements Model Context Protocol (MCP) over stdio.
- * Provides tools for LingTai agents to send/receive emails via Cloud Mail.
+ * MCP server for LingTai agents to send/receive/search emails via Cloud Mail.
+ * Uses existing Cloud Mail APIs: public/emailList (for read/search) and 
+ * send-internal (for send/reply).
  * 
- * Configuration via environment variables:
- *   CLOUD_MAIL_URL     - Base URL of the Cloud Mail Worker (e.g. https://mail.example.com)
- *   CLOUD_MAIL_API_KEY - X-API-Key for authentication
- *   AGENT_EMAIL        - Default email address for this agent (e.g. myagent@example.com)
+ * Environment variables:
+ *   CLOUD_MAIL_URL          - Base URL (e.g. https://mail.example.com)
+ *   CLOUD_MAIL_ADMIN_EMAIL  - Admin email for public API auth
+ *   CLOUD_MAIL_ADMIN_PASS   - Admin password for public API auth
+ *   CLOUD_MAIL_API_KEY      - X-API-Key for send-internal
+ *   AGENT_EMAIL             - Agent's managed email address
  */
 
 const https = require('https');
@@ -16,19 +19,21 @@ const http = require('http');
 
 // ===== Configuration =====
 const CLOUD_MAIL_URL = process.env.CLOUD_MAIL_URL || '';
-const CLOUD_MAIL_API_KEY = process.env.CLOUD_MAIL_API_KEY || '';
+const ADMIN_EMAIL = process.env.CLOUD_MAIL_ADMIN_EMAIL || '';
+const ADMIN_PASS = process.env.CLOUD_MAIL_ADMIN_PASS || '';
+const API_KEY = process.env.CLOUD_MAIL_API_KEY || '';
 const AGENT_EMAIL = process.env.AGENT_EMAIL || '';
 
-if (!CLOUD_MAIL_URL || !CLOUD_MAIL_API_KEY || !AGENT_EMAIL) {
+if (!CLOUD_MAIL_URL || !ADMIN_EMAIL || !ADMIN_PASS || !API_KEY || !AGENT_EMAIL) {
 	console.error(JSON.stringify({
 		jsonrpc: '2.0',
-		error: { code: -32000, message: 'Missing required environment variables. Need: CLOUD_MAIL_URL, CLOUD_MAIL_API_KEY, AGENT_EMAIL' }
+		error: { code: -32000, message: 'Missing env vars: CLOUD_MAIL_URL, CLOUD_MAIL_ADMIN_EMAIL, CLOUD_MAIL_ADMIN_PASS, CLOUD_MAIL_API_KEY, AGENT_EMAIL' }
 	}));
 	process.exit(1);
 }
 
 // ===== HTTP Helper =====
-function apiRequest(method, path, body) {
+function httpRequest(method, path, body, extraHeaders) {
 	return new Promise((resolve, reject) => {
 		const url = new URL(path, CLOUD_MAIL_URL);
 		const options = {
@@ -36,12 +41,8 @@ function apiRequest(method, path, body) {
 			port: url.port,
 			path: url.pathname + url.search,
 			method: method,
-			headers: {
-				'X-API-Key': CLOUD_MAIL_API_KEY,
-				'Content-Type': 'application/json'
-			}
+			headers: { 'Content-Type': 'application/json', ...extraHeaders }
 		};
-
 		const lib = url.protocol === 'https:' ? https : http;
 		const req = lib.request(options, (res) => {
 			let data = '';
@@ -49,67 +50,78 @@ function apiRequest(method, path, body) {
 			res.on('end', () => {
 				try {
 					const parsed = JSON.parse(data);
-					if (res.statusCode >= 200 && res.statusCode < 300 && parsed.code === 200) {
+					if (res.statusCode >= 200 && res.statusCode < 300 && parsed.code === 200)
 						resolve(parsed.data);
-					} else {
-						reject(new Error(parsed.message || `HTTP ${res.statusCode}: ${data}`));
-					}
+					else
+						reject(new Error(parsed.message || `HTTP ${res.statusCode}`));
 				} catch (e) {
-					reject(new Error(`Failed to parse response: ${data}`));
+					reject(new Error(`Parse error: ${data.substring(0,200)}`));
 				}
 			});
 		});
 		req.on('error', reject);
-		if (body) {
-			req.write(JSON.stringify(body));
-		}
+		if (body) req.write(JSON.stringify(body));
 		req.end();
 	});
+}
+
+// ===== Auth Token Management =====
+let publicToken = null;
+let tokenExpiry = 0;
+
+async function ensureToken() {
+	if (publicToken && Date.now() < tokenExpiry) return publicToken;
+	const result = await httpRequest('POST', '/api/public/genToken',
+		{ email: ADMIN_EMAIL, password: ADMIN_PASS });
+	publicToken = result.token;
+	tokenExpiry = Date.now() + 25 * 60 * 1000; // 25 min
+	return publicToken;
+}
+
+// Helper for public API calls (uses Authorization header with token)
+async function publicApi(method, path, body) {
+	const token = await ensureToken();
+	return httpRequest(method, path, body, { 'Authorization': token });
+}
+
+// Helper for send-internal (uses X-API-Key)
+async function internalApi(method, path, body) {
+	return httpRequest(method, path, body, { 'X-API-Key': API_KEY });
 }
 
 // ===== Tool Implementations =====
 
 const TOOLS = {
 	check: {
-		description: 'Check for new/unread emails in the agent\'s mailbox',
+		description: 'Check for emails in the agent\'s mailbox',
 		inputSchema: {
 			type: 'object',
 			properties: {
-				email: {
-					type: 'string',
-					description: 'Email address to check (default: AGENT_EMAIL)'
-				},
-				unread: {
-					type: 'boolean',
-					description: 'Only show unread emails (default: true)'
-				},
-				limit: {
-					type: 'number',
-					description: 'Max emails to return (default: 10)'
-				}
+				email: { type: 'string', description: 'Email to check (default: AGENT_EMAIL)' },
+				unread: { type: 'boolean', description: 'Only new/unread' },
+				limit: { type: 'number', description: 'Max results (default: 10)' }
 			}
 		},
 		handler: async (args) => {
 			const email = args.email || AGENT_EMAIL;
-			const params = new URLSearchParams({
-				email: email,
-				unread: args.unread !== false ? 'true' : 'false',
-				limit: String(args.limit || 10)
+			const list = await publicApi('POST', '/api/public/emailList', {
+				toEmail: email,
+				type: 0,  // RECEIVE
+				size: args.limit || 10,
+				timeSort: 'desc'
 			});
-			const emails = await apiRequest('GET', `/api/email/inbox?${params}`);
 			return {
 				content: [{
 					type: 'text',
 					text: JSON.stringify({
-						count: emails ? emails.length : 0,
-						emails: (emails || []).map(e => ({
+						count: list ? list.length : 0,
+						emails: (list || []).map(e => ({
 							id: e.emailId,
 							from: e.sendEmail,
-							name: e.name,
+							name: e.sendName,
 							subject: e.subject,
 							time: e.createTime,
-							unread: e.unread === 0,
-							preview: (e.text || '').substring(0, 100)
+							preview: (e.text || '').substring(0, 150)
 						}))
 					}, null, 2)
 				}]
@@ -122,34 +134,34 @@ const TOOLS = {
 		inputSchema: {
 			type: 'object',
 			properties: {
-				emailId: {
-					type: 'number',
-					description: 'Email ID to read'
-				}
+				emailId: { type: 'number', description: 'Email ID' }
 			},
 			required: ['emailId']
 		},
 		handler: async (args) => {
-			const email = await apiRequest('GET', `/api/email/read/${args.emailId}`);
+			// emailList with the toEmail being the agent and get recent ones, then filter by ID
+			// Since emailList doesn't have emailId filter, we get data and scan
+			const list = await publicApi('POST', '/api/public/emailList', {
+				toEmail: AGENT_EMAIL,
+				size: 100,
+				timeSort: 'desc'
+			});
+			const email = (list || []).find(e => e.emailId === args.emailId);
+			if (!email) {
+				return { content: [{ type: 'text', text: JSON.stringify({ error: 'Email not found' }) }] };
+			}
 			return {
 				content: [{
 					type: 'text',
 					text: JSON.stringify({
 						id: email.emailId,
 						from: email.sendEmail,
-						name: email.name,
+						name: email.sendName,
 						to: email.toEmail,
 						subject: email.subject,
 						text: email.text,
 						content: email.content,
-						time: email.createTime,
-						status: email.status,
-						unread: email.unread === 0,
-						attachments: (email.attList || []).map(a => ({
-							filename: a.filename,
-							size: a.size,
-							type: a.mimeType
-						}))
+						time: email.createTime
 					}, null, 2)
 				}]
 			};
@@ -157,40 +169,21 @@ const TOOLS = {
 	},
 
 	send: {
-		description: 'Send an internal email to another managed mailbox',
+		description: 'Send an internal email to managed mailbox(es)',
 		inputSchema: {
 			type: 'object',
 			properties: {
-				sender: {
-					type: 'string',
-					description: 'Sender email address (default: AGENT_EMAIL)'
-				},
-				receiveEmail: {
-					type: 'array',
-					items: { type: 'string' },
-					description: 'Recipient email addresses (must be managed domains)'
-				},
-				subject: {
-					type: 'string',
-					description: 'Email subject'
-				},
-				content: {
-					type: 'string',
-					description: 'HTML content of the email'
-				},
-				text: {
-					type: 'string',
-					description: 'Plain text content of the email'
-				},
-				name: {
-					type: 'string',
-					description: 'Sender display name'
-				}
+				sender: { type: 'string', description: 'Sender (default: AGENT_EMAIL)' },
+				receiveEmail: { type: 'array', items: { type: 'string' }, description: 'Recipients' },
+				subject: { type: 'string', description: 'Subject' },
+				content: { type: 'string', description: 'HTML body' },
+				text: { type: 'string', description: 'Plain text' },
+				name: { type: 'string', description: 'Sender display name' }
 			},
 			required: ['receiveEmail', 'subject']
 		},
 		handler: async (args) => {
-			const result = await apiRequest('POST', '/api/email/send-internal', {
+			const result = await internalApi('POST', '/api/email/send-internal', {
 				sender: args.sender || AGENT_EMAIL,
 				receiveEmail: args.receiveEmail,
 				subject: args.subject,
@@ -198,60 +191,42 @@ const TOOLS = {
 				text: args.text || '',
 				name: args.name || ''
 			});
-			return {
-				content: [{
-					type: 'text',
-					text: JSON.stringify({
-						emailId: result.emailId,
-						status: result.status,
-						recipients: result.recipients
-					}, null, 2)
-				}]
-			};
+			return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 		}
 	},
 
 	reply: {
-		description: 'Reply to an email',
+		description: 'Reply to an email (reuses send-internal)',
 		inputSchema: {
 			type: 'object',
 			properties: {
-				emailId: {
-					type: 'number',
-					description: 'ID of the email to reply to'
-				},
-				content: {
-					type: 'string',
-					description: 'HTML reply content'
-				},
-				text: {
-					type: 'string',
-					description: 'Plain text reply content'
-				},
-				name: {
-					type: 'string',
-					description: 'Sender display name'
-				}
+				emailId: { type: 'number', description: 'Email ID to reply to' },
+				content: { type: 'string', description: 'HTML reply' },
+				text: { type: 'string', description: 'Plain text reply' },
+				name: { type: 'string', description: 'Sender name' }
 			},
 			required: ['emailId']
 		},
 		handler: async (args) => {
-			const result = await apiRequest('POST', '/api/email/reply', {
-				emailId: args.emailId,
+			// Read original to extract sender
+			const list = await publicApi('POST', '/api/public/emailList', {
+				toEmail: AGENT_EMAIL,
+				size: 100,
+				timeSort: 'desc'
+			});
+			const original = (list || []).find(e => e.emailId === args.emailId);
+			if (!original) {
+				return { content: [{ type: 'text', text: JSON.stringify({ error: 'Original email not found' }) }] };
+			}
+			const result = await internalApi('POST', '/api/email/send-internal', {
+				sender: AGENT_EMAIL,
+				receiveEmail: [original.sendEmail],
+				subject: original.subject ? 'Re: ' + original.subject : 'Re:',
 				content: args.content || '',
 				text: args.text || '',
 				name: args.name || ''
 			});
-			return {
-				content: [{
-					type: 'text',
-					text: JSON.stringify({
-						emailId: result.emailId,
-						status: result.status,
-						to: result.to
-					}, null, 2)
-				}]
-			};
+			return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 		}
 	},
 
@@ -260,42 +235,34 @@ const TOOLS = {
 		inputSchema: {
 			type: 'object',
 			properties: {
-				email: {
-					type: 'string',
-					description: 'Email address to search for (default: AGENT_EMAIL)'
-				},
-				query: {
-					type: 'string',
-					description: 'Search keyword (matches subject, content, sender)'
-				},
-				limit: {
-					type: 'number',
-					description: 'Max results (default: 20)'
-				}
+				email: { type: 'string', description: 'Email to search (default: AGENT_EMAIL)' },
+				query: { type: 'string', description: 'Search keyword' },
+				limit: { type: 'number', description: 'Max results (default: 20)' }
 			},
 			required: ['query']
 		},
 		handler: async (args) => {
 			const email = args.email || AGENT_EMAIL;
-			const params = new URLSearchParams({
-				email: email,
-				query: args.query,
-				limit: String(args.limit || 20)
+			const list = await publicApi('POST', '/api/public/emailList', {
+				toEmail: email,
+				content: args.query,
+				subject: args.query,
+				sendEmail: args.query,
+				size: args.limit || 20,
+				timeSort: 'desc'
 			});
-			const emails = await apiRequest('GET', `/api/email/search?${params}`);
 			return {
 				content: [{
 					type: 'text',
 					text: JSON.stringify({
-						count: emails ? emails.length : 0,
-						results: (emails || []).map(e => ({
+						count: list ? list.length : 0,
+						results: (list || []).map(e => ({
 							id: e.emailId,
-							direction: e.type === 0 ? 'received' : 'sent',
 							from: e.sendEmail,
 							to: e.toEmail,
 							subject: e.subject,
 							time: e.createTime,
-							preview: (e.text || '').substring(0, 100)
+							preview: (e.text || '').substring(0, 150)
 						}))
 					}, null, 2)
 				}]
@@ -304,61 +271,42 @@ const TOOLS = {
 	}
 };
 
-// ===== MCP Protocol Implementation =====
-
+// ===== MCP Protocol =====
 let initialized = false;
-let messageId = 0;
 
-function sendMessage(msg) {
-	const line = JSON.stringify(msg);
-	// MCP protocol uses line-delimited JSON with newline separator
-	process.stdout.write(line + '\n');
-}
+function sendMsg(msg) { process.stdout.write(JSON.stringify(msg) + '\n'); }
 
-function sendError(id, code, message, data) {
-	sendMessage({
-		jsonrpc: '2.0',
-		id: id,
-		error: { code, message, data }
-	});
-}
+function sendErr(id, code, msg) { sendMsg({ jsonrpc: '2.0', id, error: { code, message: msg } }); }
 
-function handleRequest(request) {
-	const { id, method, params } = request;
+function handleRequest(req) {
+	const { id, method, params } = req;
 
 	if (method === 'initialize') {
 		initialized = true;
-		sendMessage({
-			jsonrpc: '2.0',
-			id: id,
+		sendMsg({
+			jsonrpc: '2.0', id,
 			result: {
 				protocolVersion: '0.1.0',
-				capabilities: {
-					tools: {}
-				},
-				serverInfo: {
-					name: 'cloud-mail-mcp',
-					version: '1.0.0'
-				}
+				capabilities: { tools: {} },
+				serverInfo: { name: 'cloud-mail-mcp', version: '1.0.0' }
 			}
 		});
+		// Auto-initialize token (async, don't block)
+		ensureToken().catch(() => {});
 		return;
 	}
 
-	if (method === 'notifications/initialized') {
-		return; // No response needed
-	}
+	if (method === 'notifications/initialized') return;
+	if (method === 'notifications/cancelled') return;
 
 	if (method === 'tools/list') {
-		const toolList = Object.entries(TOOLS).map(([name, def]) => ({
-			name: name,
-			description: def.description,
-			inputSchema: def.inputSchema
-		}));
-		sendMessage({
-			jsonrpc: '2.0',
-			id: id,
-			result: { tools: toolList }
+		sendMsg({
+			jsonrpc: '2.0', id,
+			result: {
+				tools: Object.entries(TOOLS).map(([name, def]) => ({
+					name, description: def.description, inputSchema: def.inputSchema
+				}))
+			}
 		});
 		return;
 	}
@@ -366,46 +314,24 @@ function handleRequest(request) {
 	if (method === 'tools/call') {
 		const { name, arguments: args } = params;
 		const tool = TOOLS[name];
-		if (!tool) {
-			sendError(id, -32601, `Tool not found: ${name}`);
-			return;
-		}
+		if (!tool) return sendErr(id, -32601, `Tool not found: ${name}`);
 
 		tool.handler(args || {})
-			.then(result => {
-				sendMessage({
-					jsonrpc: '2.0',
-					id: id,
-					result: result
-				});
-			})
-			.catch(err => {
-				sendError(id, -32000, err.message);
-			});
+			.then(r => sendMsg({ jsonrpc: '2.0', id, result: r }))
+			.catch(e => sendErr(id, -32000, e.message));
 		return;
 	}
 
-	// Method not found
-	sendError(id, -32601, `Method not found: ${method}`);
+	if (method === 'ping') {
+		sendMsg({ jsonrpc: '2.0', id, result: {} });
+		return;
+	}
+
+	sendErr(id, -32601, `Unknown method: ${method}`);
 }
 
 // ===== Main Loop =====
 const readline = require('readline');
-const rl = readline.createInterface({
-	input: process.stdin,
-	output: process.stdout,  // We write responses to stdout directly
-	terminal: false
-});
-
-rl.on('line', (line) => {
-	try {
-		const request = JSON.parse(line.trim());
-		handleRequest(request);
-	} catch (e) {
-		console.error('Failed to parse request:', line, e.message);
-	}
-});
-
-rl.on('close', () => {
-	process.exit(0);
-});
+const rl = readline.createInterface({ input: process.stdin, terminal: false });
+rl.on('line', line => { try { handleRequest(JSON.parse(line.trim())); } catch (e) { /* ignore parse errors */ } });
+rl.on('close', () => process.exit(0));
