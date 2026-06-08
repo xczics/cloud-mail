@@ -1,0 +1,16 @@
+{
+  "name": "cloud-mail-mcp",
+  "version": "1.0.0",
+  "description": "MCP addon for Cloud Mail - send/receive/search emails via Cloudflare Workers",
+  "main": "index.js",
+  "bin": {
+    "cloud-mail-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["mcp", "cloud-mail", "lingtai"],
+  "author": "Lingtai Network",
+  "license": "MIT",
+  "type": "commonjs"
+}
